@@ -13,7 +13,7 @@ if(NOT UNIX)
 endif()
 
 # set version
-set(NP2SRV_VERSION 0.3.84)
+set(NP2SRV_VERSION 0.5.15)
 
 # set default build type if not specified by user
 if(NOT CMAKE_BUILD_TYPE)
@@ -62,14 +62,7 @@ endif()
 
 # set default SSH key
 if (KEYSTORED_KEYS_DIR STREQUAL "none")
-    message(STATUS "Server configuration off, default SSH host key will be used.")
-    # if (EXISTS) succeeds only if the file is readable, we do not care about that
-    execute_process(COMMAND ls "${DEFAULT_HOST_KEY}" RESULT_VARIABLE RET OUTPUT_QUIET ERROR_QUIET)
-    if (NOT RET)
-        message(STATUS "Default host key set to \"${DEFAULT_HOST_KEY}\".")
-    else()
-        message(FATAL_ERROR "Host key \"${DEFAULT_HOST_KEY}\" not found, rerun cmake and set DEFAULT_HOST_KEY manually to point to an RSA SSH key.")
-    endif()
+    message(STATUS "Server configuration off, default SSH host key will be used: \"${DEFAULT_HOST_KEY}\".")
 endif()
 
 # check that lnc2 supports np2srv thread count
@@ -243,7 +236,8 @@ if (ENABLE_CONFIGURATION)
         endif()")
 endif()
 
-configure_file("${PROJECT_SOURCE_DIR}/config.h.in" "${PROJECT_SOURCE_DIR}/config.h" ESCAPE_QUOTES @ONLY)
+configure_file("${PROJECT_SOURCE_DIR}/config.h.in" "${PROJECT_BINARY_DIR}/config.h" ESCAPE_QUOTES @ONLY)
+include_directories(${PROJECT_BINARY_DIR})
 
 # clean cmake cache
 add_custom_target(cleancache

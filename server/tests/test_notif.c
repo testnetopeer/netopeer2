@@ -27,10 +27,10 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "config.h"
+#include "tests/config.h"
 
 #define main server_main
-#include "../config.h"
+#include "config.h"
 #undef NP2SRV_PIDFILE
 #define NP2SRV_PIDFILE "/tmp/test_np2srv.pid"
 
@@ -220,6 +220,7 @@ __wrap_sr_event_notif_subscribe(sr_session_ctx_t *session, const char *xpath, sr
     printf("test: New subscription to %s\n", xpath);
     notif_clb = callback;
     notif_clb_data = private_ctx;
+    ncm_session_add((struct nc_session *)notif_clb_data);
     return SR_ERR_OK;
 }
 

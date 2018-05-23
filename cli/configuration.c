@@ -28,6 +28,10 @@
 #include <libyang/libyang.h>
 #include <nc_client.h>
 
+#ifndef HAVE_EACCESS
+#define eaccess access
+#endif
+
 #include "configuration.h"
 #include "commands.h"
 #include "linenoise/linenoise.h"
@@ -277,7 +281,7 @@ load_config(void)
         }
     }
 
-    ctx = ly_ctx_new(NULL);
+    ctx = ly_ctx_new(NULL, 0);
     if (!ctx) {
         ERROR(__func__, "Failed to create context.");
         ERROR(__func__, "Unable to load configuration due to the previous error.");
@@ -305,7 +309,17 @@ load_config(void)
                             config_editor = strdup(child->content);
                         } else if (!strcmp(child->name, "searchpath")) {
                             /* doc -> <netconf-client> -> <searchpath> */
-                            nc_client_set_schema_searchpath(child->content);
+                            errno = 0;
+                            if (eaccess(child->content, R_OK | W_OK | X_OK) && (errno == ENOENT)) {
+                                ERROR(__func__, "Search path \"%s\" does not exist, creating it.", child->content);
+                                if (mkdir(child->content, 00700)) {
+                                    ERROR(__func__, "Search path \"%s\" cannot be created: %s", child->content, strerror(errno));
+                                } else {
+                                    nc_client_set_schema_searchpath(child->content);
+                                }
+                            } else {
+                                nc_client_set_schema_searchpath(child->content);
+                            }
                         } else if (!strcmp(child->name, "output-format")) {
                             /* doc -> <netconf-client> -> <output-format> */
                             if (!strcmp(child->content, "json")) {

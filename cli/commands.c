@@ -3,7 +3,7 @@
  * @author Michal Vasko <mvasko@cesnet.cz>
  * @brief netopeer2-cli commands
  *
- * Copyright (c) 2015 CESNET, z.s.p.o.
+ * Copyright (c) 2017 CESNET, z.s.p.o.
  *
  * This source code is licensed under BSD 3-Clause License (the "License").
  * You may not use this file except in compliance with the License.
@@ -37,6 +37,10 @@
 #   include <openssl/x509v3.h>
 #endif
 
+#ifndef HAVE_EACCESS
+#define eaccess access
+#endif
+
 #include "commands.h"
 #include "configuration.h"
 #include "completion.h"
@@ -64,6 +68,7 @@ char *config_editor;
 struct nc_session *session;
 volatile pthread_t ntf_tid;
 volatile int interleave;
+int timed;
 
 int cmd_disconnect(const char *arg, char **tmp_config_file);
 
@@ -104,8 +109,8 @@ static int
 addargs(struct arglist *args, char *format, ...)
 {
     va_list arguments;
-    char *aux = NULL, *aux1 = NULL;
-    int len;
+    char *aux = NULL, *aux1 = NULL, *prev_aux, quot;
+    int spaces;
 
     if (args == NULL) {
         return EXIT_FAILURE;
@@ -113,18 +118,13 @@ addargs(struct arglist *args, char *format, ...)
 
     /* store arguments to aux string */
     va_start(arguments, format);
-    if ((len = vasprintf(&aux, format, arguments)) == -1) {
+    if (vasprintf(&aux, format, arguments) == -1) {
         va_end(arguments);
         ERROR(__func__, "vasprintf() failed (%s)", strerror(errno));
         return EXIT_FAILURE;
     }
     va_end(arguments);
 
-    /* parse aux string and store it to the arglist */
-    /* find \n and \t characters and replace them by space */
-    while ((aux1 = strpbrk(aux, "\n\t")) != NULL) {
-        *aux1 = ' ';
-    }
     /* remember the begining of the aux string to free it after operations */
     aux1 = aux;
 
@@ -132,9 +132,12 @@ addargs(struct arglist *args, char *format, ...)
      * get word by word from given string and store words separately into
      * the arglist
      */
-    for (aux = strtok(aux, " "); aux; aux = strtok(NULL, " ")) {
-        if (!strcmp(aux, ""))
-        continue;
+    prev_aux = NULL;
+    quot = 0;
+    for (aux = strtok(aux, " \n\t"); aux; prev_aux = aux, aux = strtok(NULL, " \n\t")) {
+        if (!strcmp(aux, "")) {
+            continue;
+        }
 
         if (!args->list) { /* initial memory allocation */
             if ((args->list = (char **)malloc(8 * sizeof(char *))) == NULL) {
@@ -143,7 +146,7 @@ addargs(struct arglist *args, char *format, ...)
             }
             args->size = 8;
             args->count = 0;
-        } else if (args->count + 2 >= args->size) {
+        } else if (!quot && (args->count + 2 >= args->size)) {
             /*
              * list is too short to add next to word so we have to
              * extend it
@@ -151,13 +154,41 @@ addargs(struct arglist *args, char *format, ...)
             args->size += 8;
             args->list = realloc(args->list, args->size * sizeof(char *));
         }
-        /* add word in the end of the list */
-        if ((args->list[args->count] = malloc((strlen(aux) + 1) * sizeof(char))) == NULL) {
-            ERROR(__func__, "Memory allocation failed (%s:%d)", __FILE__, __LINE__);
-            return EXIT_FAILURE;
+
+        if (!quot) {
+            /* add word at the end of the list */
+            if ((args->list[args->count] = malloc((strlen(aux) + 1) * sizeof(char))) == NULL) {
+                ERROR(__func__, "Memory allocation failed (%s:%d)", __FILE__, __LINE__);
+                return EXIT_FAILURE;
+            }
+
+            /* quoted argument */
+            if ((aux[0] == '\'') || (aux[0] == '\"')) {
+                quot = aux[0];
+                ++aux;
+                /* ...but without spaces */
+                if (aux[strlen(aux) - 1] == quot) {
+                    quot = 0;
+                    aux[strlen(aux) - 1] = '\0';
+                }
+            }
+
+            strcpy(args->list[args->count], aux);
+            args->list[++args->count] = NULL; /* last argument */
+        } else {
+            /* append another part of the argument */
+            spaces = aux - (prev_aux + strlen(prev_aux));
+            args->list[args->count - 1] = realloc(args->list[args->count - 1],
+                                                  strlen(args->list[args->count - 1]) + spaces + strlen(aux) + 1);
+
+            /* end of quoted argument */
+            if (aux[strlen(aux) - 1] == quot) {
+                quot = 0;
+                aux[strlen(aux) - 1] = '\0';
+            }
+
+            sprintf(args->list[args->count - 1] + strlen(args->list[args->count - 1]), "%*s%s", spaces, " ", aux);
         }
-        strcpy(args->list[args->count], aux);
-        args->list[++args->count] = NULL; /* last argument */
     }
 
     /* clean up */
@@ -199,10 +230,53 @@ cli_ntf_clb(struct nc_session *session, const struct nc_notif *notif)
 }
 
 static int
-cli_send_recv(struct nc_rpc *rpc, FILE *output)
+cli_gettimespec(struct timespec *ts, int *mono)
+{
+    errno = 0;
+
+#ifdef CLOCK_MONOTONIC_RAW
+    *mono = 1;
+    return clock_gettime(CLOCK_MONOTONIC_RAW, ts);
+#elif defined(CLOCK_MONOTONIC)
+    *mono = 1;
+    return clock_gettime(CLOCK_MONOTONIC, ts);
+#elif defined(CLOCK_REALTIME)
+    /* no monotonic clock available, return realtime */
+    *mono = 0;
+    return clock_gettime(CLOCK_REALTIME, ts);
+#else
+    *mono = 0;
+
+    int rc;
+    struct timeval tv;
+
+    rc = gettimeofday(&tv, NULL);
+    if (!rc) {
+        ts->tv_sec = (time_t)tv.tv_sec;
+        ts->tv_nsec = 1000L * (long)tv.tv_usec;
+    }
+    return rc;
+#endif
+}
+
+/* returns milliseconds */
+static int32_t
+cli_difftimespec(const struct timespec *ts1, const struct timespec *ts2)
+{
+    int64_t nsec_diff = 0;
+
+    nsec_diff += (((int64_t)ts2->tv_sec) - ((int64_t)ts1->tv_sec)) * 1000000000L;
+    nsec_diff += ((int64_t)ts2->tv_nsec) - ((int64_t)ts1->tv_nsec);
+
+    return (nsec_diff ? nsec_diff / 1000000L : 0);
+}
+
+static int
+cli_send_recv(struct nc_rpc *rpc, FILE *output, NC_WD_MODE wd_mode)
 {
     char *str, *model_data;
-    int ret = 0;
+    int ret = 0, ly_wd, mono;
+    int32_t msec;
     uint16_t i, j;
     uint64_t msgid;
     struct lyd_node_anydata *any;
@@ -210,6 +284,15 @@ cli_send_recv(struct nc_rpc *rpc, FILE *output)
     struct nc_reply *reply;
     struct nc_reply_data *data_rpl;
     struct nc_reply_error *error;
+    struct timespec ts_start, ts_stop;
+
+    if (timed) {
+        ret = cli_gettimespec(&ts_start, &mono);
+        if (ret) {
+            ERROR(__func__, "Getting current time failed (%s).", strerror(errno));
+            return ret;
+        }
+    }
 
     msgtype = nc_send_rpc(session, rpc, 1000, &msgid);
     if (msgtype == NC_MSG_ERROR) {
@@ -224,7 +307,7 @@ cli_send_recv(struct nc_rpc *rpc, FILE *output)
     }
 
 recv_reply:
-    msgtype = nc_recv_reply(session, rpc, msgid, 10000,
+    msgtype = nc_recv_reply(session, rpc, msgid, 20000,
                             LYD_OPT_DESTRUCT | LYD_OPT_NOSIBLINGS, &reply);
     if (msgtype == NC_MSG_ERROR) {
         ERROR(__func__, "Failed to receive a reply.");
@@ -235,6 +318,23 @@ recv_reply:
     } else if (msgtype == NC_MSG_WOULDBLOCK) {
         ERROR(__func__, "Timeout for receiving a reply expired.");
         return -1;
+    } else if (msgtype == NC_MSG_NOTIF) {
+        /* read again */
+        goto recv_reply;
+    } else if (msgtype == NC_MSG_REPLY_ERR_MSGID) {
+        /* unexpected message, try reading again to get the correct reply */
+        ERROR(__func__, "Unexpected reply received - ignoring and waiting for the correct reply.");
+        nc_reply_free(reply);
+        goto recv_reply;
+    }
+
+    if (timed) {
+        ret = cli_gettimespec(&ts_stop, &mono);
+        if (ret) {
+            ERROR(__func__, "Getting current time failed (%s).", strerror(errno));
+            nc_reply_free(reply);
+            return ret;
+        }
     }
 
     switch (reply->type) {
@@ -246,13 +346,15 @@ recv_reply:
 
         /* special case */
         if (nc_rpc_get_type(rpc) == NC_RPC_GETSCHEMA) {
-            if (output == stdout) {
-                fprintf(output, "MODULE\n");
-            }
-            if ((data_rpl->data->schema->nodetype != LYS_RPC) || (data_rpl->data->child->schema->nodetype != LYS_ANYXML)) {
+            if ((data_rpl->data->schema->nodetype != LYS_RPC) ||
+                (data_rpl->data->child == NULL) ||
+                (data_rpl->data->child->schema->nodetype != LYS_ANYXML)) {
                 ERROR(__func__, "Unexpected data reply to <get-schema> RPC.");
                 ret = -1;
                 break;
+            }
+            if (output == stdout) {
+                fprintf(output, "MODULE\n");
             }
             any = (struct lyd_node_anydata *)data_rpl->data->child;
             switch (any->value_type) {
@@ -300,7 +402,26 @@ recv_reply:
                 break;
             }
         }
-        lyd_print_file(output, data_rpl->data, output_format, LYP_WITHSIBLINGS | output_flag);
+
+        switch (wd_mode) {
+        case NC_WD_ALL:
+            ly_wd = LYP_WD_ALL;
+            break;
+        case NC_WD_ALL_TAG:
+            ly_wd = LYP_WD_ALL_TAG;
+            break;
+        case NC_WD_TRIM:
+            ly_wd = LYP_WD_TRIM;
+            break;
+        case NC_WD_EXPLICIT:
+            ly_wd = LYP_WD_EXPLICIT;
+            break;
+        default:
+            ly_wd = 0;
+            break;
+        }
+
+        lyd_print_file(output, data_rpl->data, output_format, LYP_WITHSIBLINGS | ly_wd | output_flag);
         if (output == stdout) {
             fprintf(output, "\n");
         } else {
@@ -369,6 +490,11 @@ recv_reply:
     if (msgtype == NC_MSG_REPLY_ERR_MSGID) {
         ERROR(__func__, "Trying to receive another message...\n");
         goto recv_reply;
+    }
+
+    if (timed) {
+        msec = cli_difftimespec(&ts_start, &ts_stop);
+        fprintf(output, "%s %2dm%d,%03ds\n", mono ? "mono" : "real", msec / 60000, (msec % 60000) / 1000, msec % 1000);
     }
 
     return ret;
@@ -539,7 +665,7 @@ trim_top_elem(char *data, const char *top_elem, const char *top_elem_ns)
 void
 cmd_searchpath_help(void)
 {
-    printf("searchpath <model-dir-path>\n");
+    printf("searchpath [<model-dir-path>]\n");
 }
 
 void
@@ -679,7 +805,7 @@ cmd_copyconfig_help(void)
         }
     }
 
-    printf("copy-config [--help] --target %s%s%s%s (--source %s%s%s%s | --src-config [<file>])%s\n",
+    printf("copy-config [--help] --target %s%s%s%s (--source %s%s%s%s | --src-config[=<file>])%s\n",
            running, startup, candidate, url,
            running, startup, candidate, url, defaults);
 }
@@ -772,7 +898,7 @@ cmd_editconfig_help(void)
         bracket = "";
     }
 
-    printf("edit-config [--help] --target %s%s %s--config [<file>]%s [--defop merge|replace|none] "
+    printf("edit-config [--help] --target %s%s %s--config[=<file>]%s [--defop merge|replace|none] "
            "%s[--error stop|continue%s]\n", running, candidate, bracket, url, validate, rollback);
 }
 
@@ -793,7 +919,7 @@ cmd_get_help(void)
         xpath = "";
     }
 
-    fprintf(stdout, "get [--help] [--filter-subtree [<file>]%s] %s[--out <file>]\n", xpath, defaults);
+    fprintf(stdout, "get [--help] [--filter-subtree[=<file>]%s] %s[--out <file>]\n", xpath, defaults);
 }
 
 void
@@ -826,7 +952,7 @@ cmd_getconfig_help(void)
         candidate = "";
     }
 
-    printf("get-config [--help] --source running%s%s [--filter-subtree [<file>]%s] %s[--out <file>]\n",
+    printf("get-config [--help] --source running%s%s [--filter-subtree[=<file>]%s] %s[--out <file>]\n",
            startup, candidate, xpath, defaults);
 }
 
@@ -909,7 +1035,7 @@ cmd_validate_help(void)
             url = "";
         }
     }
-    printf("validate [--help] (--source running%s%s%s | --src-config [<file>])\n",
+    printf("validate [--help] (--source running%s%s%s | --src-config[=<file>])\n",
            startup, candidate, url);
 }
 
@@ -929,7 +1055,7 @@ cmd_subscribe_help(void)
         xpath = "";
     }
 
-    printf("subscribe [--help] [--filter-subtree [<file>]%s] [--begin <time>] [--end <time>] [--stream <stream>] [--out <file>]\n", xpath);
+    printf("subscribe [--help] [--filter-subtree[=<file>]%s] [--begin <time>] [--end <time>] [--stream <stream>] [--out <file>]\n", xpath);
     printf("\t<time> has following format:\n");
     printf("\t\t+<num>  - current time plus the given number of seconds.\n");
     printf("\t\t<num>   - absolute time as number of seconds since 1970-01-01.\n");
@@ -939,7 +1065,7 @@ cmd_subscribe_help(void)
 void
 cmd_getschema_help(void)
 {
-    if (session && !ly_ctx_get_module(nc_session_get_ctx(session), "ietf-netconf-monitoring", NULL)) {
+    if (session && !ly_ctx_get_module(nc_session_get_ctx(session), "ietf-netconf-monitoring", NULL, 1)) {
         printf("get-schema is not supported by the current session.\n");
         return;
     }
@@ -951,6 +1077,12 @@ void
 cmd_userrpc_help(void)
 {
     printf("user-rpc [--help] [--content <file>] [--out <file>]\n");
+}
+
+void
+cmd_timed_help(void)
+{
+    printf("timed [--help] [on | off]\n");
 }
 
 #ifdef NC_ENABLED_SSH
@@ -1417,11 +1549,12 @@ cmd_connect_listen_ssh(struct arglist *cmd, int is_connect)
         printf("Waiting %ds for an SSH Call Home connection on port %u...\n", timeout, port);
         ret = nc_accept_callhome(timeout * 1000, NULL, &session);
         nc_client_ssh_ch_del_bind(host, port);
-        if (ret == -1) {
-            ERROR(func_name, "Receiving SSH Call Home on port %d as user \"%s\" failed.", port, user);
-            return EXIT_FAILURE;
-        } else if (ret == 0) {
-            ERROR(func_name, "Receiving SSH Call Home on port %d as user \"%s\" timeouted.", port, user);
+        if (ret != 1) {
+            if (ret == 0) {
+                ERROR(func_name, "Receiving SSH Call Home on port %d as user \"%s\" timeout elapsed.", port, user);
+            } else {
+                ERROR(func_name, "Receiving SSH Call Home on port %d as user \"%s\" failed.", port, user);
+            }
             return EXIT_FAILURE;
         }
     }
@@ -1541,10 +1674,18 @@ parse_cert(const char *name, const char *path)
                     first_san = 0;
                 }
                 if (san_name->type == GEN_EMAIL) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
                     BIO_printf(bio_out, "RFC822:%s", (char*) ASN1_STRING_data(san_name->d.rfc822Name));
+#else
+                    BIO_printf(bio_out, "RFC822:%s", (char*) ASN1_STRING_get0_data(san_name->d.rfc822Name));
+#endif
                 }
                 if (san_name->type == GEN_DNS) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
                     BIO_printf(bio_out, "DNS:%s", (char*) ASN1_STRING_data(san_name->d.dNSName));
+#else
+                    BIO_printf(bio_out, "DNS:%s", (char*) ASN1_STRING_get0_data(san_name->d.dNSName));
+#endif
                 }
                 if (san_name->type == GEN_IPADD) {
                     BIO_printf(bio_out, "IP:");
@@ -1582,7 +1723,7 @@ parse_crl(const char *name, const char *path)
     BIO *bio_out;
     FILE *fp;
     X509_CRL *crl;
-    ASN1_INTEGER* bs;
+    const ASN1_INTEGER* bs;
     X509_REVOKED* rev;
 
     fp = fopen(path, "r");
@@ -1606,11 +1747,19 @@ parse_crl(const char *name, const char *path)
     BIO_printf(bio_out, "\n");
 
     BIO_printf(bio_out, "Last update: ");
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
     ASN1_TIME_print(bio_out, X509_CRL_get_lastUpdate(crl));
+#else
+    ASN1_TIME_print(bio_out, X509_CRL_get0_lastUpdate(crl));
+#endif
     BIO_printf(bio_out, "\n");
 
     BIO_printf(bio_out, "Next update: ");
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
     ASN1_TIME_print(bio_out, X509_CRL_get_nextUpdate(crl));
+#else
+    ASN1_TIME_print(bio_out, X509_CRL_get0_nextUpdate(crl));
+#endif
     BIO_printf(bio_out, "\n");
 
     BIO_printf(bio_out, "REVOKED:\n");
@@ -1619,14 +1768,22 @@ parse_crl(const char *name, const char *path)
         BIO_printf(bio_out, "\tNone\n");
     }
     while (rev != NULL) {
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
         bs = rev->serialNumber;
+#else
+        bs = X509_REVOKED_get0_serialNumber(rev);
+#endif
         BIO_printf(bio_out, "\tSerial no.: ");
         for (i = 0; i < bs->length; i++) {
             BIO_printf(bio_out, "%02x", bs->data[i]);
         }
-        BIO_printf(bio_out, "  Date: ");
 
+        BIO_printf(bio_out, "  Date: ");
+#if OPENSSL_VERSION_NUMBER < 0x10100000L // < 1.1.0
         ASN1_TIME_print(bio_out, rev->revocationDate);
+#else
+        ASN1_TIME_print(bio_out, X509_REVOKED_get0_revocationDate(rev));
+#endif
         BIO_printf(bio_out, "\n");
 
         X509_REVOKED_free(rev);
@@ -2162,11 +2319,11 @@ cmd_connect_listen_tls(struct arglist *cmd, int is_connect)
         goto error_cleanup;
     }
 
-    nc_client_tls_set_cert_key_paths(cert, key);
-    nc_client_tls_set_trusted_ca_paths(trusted_store, trusted_dir);
-    nc_client_tls_set_crl_paths(NULL, crl_dir);
-
     if (is_connect) {
+        nc_client_tls_set_cert_key_paths(cert, key);
+        nc_client_tls_set_trusted_ca_paths(trusted_store, trusted_dir);
+        nc_client_tls_set_crl_paths(NULL, crl_dir);
+
         /* default port */
         if (!port) {
             port = NC_PORT_TLS;
@@ -2184,6 +2341,10 @@ cmd_connect_listen_tls(struct arglist *cmd, int is_connect)
             goto error_cleanup;
         }
     } else {
+        nc_client_tls_ch_set_cert_key_paths(cert, key);
+        nc_client_tls_ch_set_trusted_ca_paths(trusted_store, trusted_dir);
+        nc_client_tls_ch_set_crl_paths(NULL, crl_dir);
+
         /* default timeout */
         if (!timeout) {
             timeout = CLI_CH_TIMEOUT;
@@ -2204,8 +2365,12 @@ cmd_connect_listen_tls(struct arglist *cmd, int is_connect)
         ERROR(func_name, "Waiting %ds for a TLS Call Home connection on port %u...", timeout, port);
         ret = nc_accept_callhome(timeout * 1000, NULL, &session);
         nc_client_tls_ch_del_bind(host, port);
-        if (ret) {
-            ERROR(func_name, "Receiving TLS Call Home on port %d failed.", port);
+        if (ret != 1) {
+            if (ret == 0) {
+                ERROR(func_name, "Receiving TLS Call Home on port %d timeout elapsed.", port);
+            } else {
+                ERROR(func_name, "Receiving TLS Call Home on port %d failed.", port);
+            }
             goto error_cleanup;
         }
     }
@@ -2227,18 +2392,20 @@ cmd_searchpath(const char *arg, char **UNUSED(tmp_config_file))
 {
     const char *path;
 
-    if (strchr(arg, ' ') == NULL) {
-        fprintf(stderr, "Missing the search path.\n");
-        return 1;
-    }
-    path = strchr(arg, ' ')+1;
+    for (arg += 10; isspace(arg[0]); ++arg);
 
-    if (!strcmp(path, "-h") || !strcmp(path, "--help")) {
+    if (!arg[0]) {
+        path = nc_client_get_schema_searchpath();
+        fprintf(stdout, "%s\n", path[0] ? path : "<none>");
+        return 0;
+    }
+
+    if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
         cmd_searchpath_help();
         return 0;
     }
 
-    nc_client_set_schema_searchpath(path);
+    nc_client_set_schema_searchpath(arg);
     return 0;
 }
 
@@ -2335,7 +2502,8 @@ cmd_disconnect(const char *UNUSED(arg), char **UNUSED(tmp_config_file))
 int
 cmd_status(const char *UNUSED(arg), char **UNUSED(tmp_config_file))
 {
-    const char *s, **cpblts;
+    const char *s;
+    const char * const *cpblts;
     int i;
 
     if (!session) {
@@ -2616,7 +2784,7 @@ cmd_cancelcommit(const char *arg, char **UNUSED(tmp_config_file))
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
 
@@ -2699,7 +2867,7 @@ cmd_commit(const char *arg, char **UNUSED(tmp_config_file))
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
 
@@ -2794,7 +2962,7 @@ cmd_copyconfig(const char *arg, char **tmp_config_file)
                 /* open edit configuration data from the file */
                 config_fd = open(optarg, O_RDONLY);
                 if (config_fd == -1) {
-                    ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                    ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                     goto fail;
                 }
 
@@ -2888,7 +3056,7 @@ cmd_copyconfig(const char *arg, char **tmp_config_file)
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
 
@@ -2975,7 +3143,7 @@ cmd_deleteconfig(const char *arg, char **UNUSED(tmp_config_file))
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
 
@@ -3044,7 +3212,7 @@ cmd_discardchanges(const char *arg, char **UNUSED(tmp_config_file))
         return EXIT_FAILURE;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
     return ret;
@@ -3148,7 +3316,7 @@ cmd_editconfig(const char *arg, char **tmp_config_file)
                 /* open edit configuration data from the file */
                 config_fd = open(optarg, O_RDONLY);
                 if (config_fd == -1) {
-                    ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                    ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                     goto fail;
                 }
 
@@ -3236,7 +3404,7 @@ cmd_editconfig(const char *arg, char **tmp_config_file)
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
 
@@ -3293,7 +3461,7 @@ cmd_get(const char *arg, char **tmp_config_file)
                 /* open edit configuration data from the file */
                 config_fd = open(optarg, O_RDONLY);
                 if (config_fd == -1) {
-                    ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                    ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                     goto fail;
                 }
 
@@ -3396,9 +3564,9 @@ cmd_get(const char *arg, char **tmp_config_file)
     }
 
     if (output) {
-        ret = cli_send_recv(rpc, output);
+        ret = cli_send_recv(rpc, output, wd);
     } else {
-        ret = cli_send_recv(rpc, stdout);
+        ret = cli_send_recv(rpc, stdout, wd);
     }
 
     nc_rpc_free(rpc);
@@ -3473,7 +3641,7 @@ cmd_getconfig(const char *arg, char **tmp_config_file)
                 /* open edit configuration data from the file */
                 config_fd = open(optarg, O_RDONLY);
                 if (config_fd == -1) {
-                    ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                    ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                     goto fail;
                 }
 
@@ -3582,9 +3750,9 @@ cmd_getconfig(const char *arg, char **tmp_config_file)
     }
 
     if (output) {
-        ret = cli_send_recv(rpc, output);
+        ret = cli_send_recv(rpc, output, wd);
     } else {
-        ret = cli_send_recv(rpc, stdout);
+        ret = cli_send_recv(rpc, stdout, wd);
     }
 
     nc_rpc_free(rpc);
@@ -3674,7 +3842,7 @@ cmd_killsession(const char *arg, char **UNUSED(tmp_config_file))
         return EXIT_FAILURE;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
     return ret;
@@ -3761,7 +3929,7 @@ cmd_lock(const char *arg, char **UNUSED(tmp_config_file))
         return EXIT_FAILURE;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
     return ret;
@@ -3848,7 +4016,7 @@ cmd_unlock(const char *arg, char **UNUSED(tmp_config_file))
         return EXIT_FAILURE;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
     return ret;
@@ -3920,7 +4088,7 @@ cmd_validate(const char *arg, char **tmp_config_file)
                 /* open edit configuration data from the file */
                 config_fd = open(optarg, O_RDONLY);
                 if (config_fd == -1) {
-                    ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                    ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                     goto fail;
                 }
 
@@ -3998,7 +4166,7 @@ cmd_validate(const char *arg, char **tmp_config_file)
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
 
     nc_rpc_free(rpc);
 
@@ -4058,7 +4226,7 @@ cmd_subscribe(const char *arg, char **tmp_config_file)
                 /* open edit configuration data from the file */
                 config_fd = open(optarg, O_RDONLY);
                 if (config_fd == -1) {
-                    ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                    ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                     goto fail;
                 }
 
@@ -4169,7 +4337,7 @@ cmd_subscribe(const char *arg, char **tmp_config_file)
         goto fail;
     }
 
-    ret = cli_send_recv(rpc, stdout);
+    ret = cli_send_recv(rpc, stdout, 0);
     nc_rpc_free(rpc);
 
     if (ret) {
@@ -4295,9 +4463,9 @@ cmd_getschema(const char *arg, char **UNUSED(tmp_config_file))
     }
 
     if (output) {
-        ret = cli_send_recv(rpc, output);
+        ret = cli_send_recv(rpc, output, 0);
     } else {
-        ret = cli_send_recv(rpc, stdout);
+        ret = cli_send_recv(rpc, stdout, 0);
     }
 
     nc_rpc_free(rpc);
@@ -4350,7 +4518,7 @@ cmd_userrpc(const char *arg, char **tmp_config_file)
             /* open edit configuration data from the file */
             config_fd = open(optarg, O_RDONLY);
             if (config_fd == -1) {
-                ERROR(__func__, "Unable to open the local datastore file (%s).", strerror(errno));
+                ERROR(__func__, "Unable to open the local datastore file \"%s\" (%s).", optarg, strerror(errno));
                 goto fail;
             }
 
@@ -4427,9 +4595,9 @@ cmd_userrpc(const char *arg, char **tmp_config_file)
     }
 
     if (output) {
-        ret = cli_send_recv(rpc, output);
+        ret = cli_send_recv(rpc, output, 0);
     } else {
-        ret = cli_send_recv(rpc, stdout);
+        ret = cli_send_recv(rpc, stdout, 0);
     }
 
     nc_rpc_free(rpc);
@@ -4441,6 +4609,29 @@ fail:
     }
     free(content);
     return ret;
+}
+
+int
+cmd_timed(const char *arg, char **UNUSED(tmp_config_file))
+{
+    char *args = strdupa(arg);
+    char *cmd = NULL;
+
+    strtok(args, " ");
+    if ((cmd = strtok(NULL, " ")) == NULL) {
+        fprintf(stdout, "All commands will %sbe timed.\n", timed ? "" : "not ");
+    } else {
+        if (!strcmp(cmd, "on")) {
+            timed = 1;
+        } else if (!strcmp(cmd, "off")) {
+            timed = 0;
+        } else {
+            ERROR(__func__, "Unknown option %s.", cmd);
+            cmd_timed_help();
+        }
+    }
+
+    return 0;
 }
 
 COMMAND commands[] = {
@@ -4478,6 +4669,7 @@ COMMAND commands[] = {
         {"subscribe", cmd_subscribe, cmd_subscribe_help, "notifications <create-subscription> operation"},
         {"get-schema", cmd_getschema, cmd_getschema_help, "ietf-netconf-monitoring <get-schema> operation"},
         {"user-rpc", cmd_userrpc, cmd_userrpc_help, "Send your own content in an RPC envelope (for DEBUG purposes)"},
+        {"timed", cmd_timed, cmd_timed_help, "Time all the commands (that communicate with a server) from issuing a RPC to getting a reply"},
         /* synonyms for previous commands */
         {"?", cmd_help, NULL, "Display commands description"},
         {"exit", cmd_quit, NULL, "Quit the program"},

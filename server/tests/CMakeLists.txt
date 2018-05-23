@@ -31,7 +31,7 @@ foreach(mock_func IN LISTS test_close_session_mock_funcs test_get_mock_funcs ${t
 endforeach()
 
 set(test test_edit_get_config)
-set(${test}_mock_funcs sr_get_items_iter sr_get_item_next sr_free_val_iter sr_move_item)
+set(${test}_mock_funcs sr_get_items_iter sr_get_item_next sr_free_val_iter sr_move_item sr_session_set_options)
 set(${test}_wrap_link_flags "-Wl")
 foreach(mock_func IN LISTS test_close_session_mock_funcs test_get_mock_funcs test_copy_config_mock_funcs ${test}_mock_funcs)
     set(${test}_wrap_link_flags "${${test}_wrap_link_flags},--wrap=${mock_func}")
@@ -74,7 +74,7 @@ foreach(test_name IN LISTS tests)
     add_test(NAME ${test_name} COMMAND $<TARGET_FILE:${test_name}>)
 endforeach(test_name)
 
-configure_file("${PROJECT_SOURCE_DIR}/tests/config.h.in" "${PROJECT_SOURCE_DIR}/tests/config.h" ESCAPE_QUOTES @ONLY)
+configure_file("${PROJECT_SOURCE_DIR}/tests/config.h.in" "${PROJECT_BINARY_DIR}/tests/config.h" ESCAPE_QUOTES @ONLY)
 
 if(ENABLE_VALGRIND_TESTS)
     find_program(valgrind_FOUND valgrind)

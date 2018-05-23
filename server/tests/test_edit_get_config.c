@@ -29,10 +29,10 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "config.h"
+#include "tests/config.h"
 
 #define main server_main
-#include "../config.h"
+#include "config.h"
 #undef NP2SRV_PIDFILE
 #define NP2SRV_PIDFILE "/tmp/test_np2srv.pid"
 
@@ -72,9 +72,9 @@ __wrap_sr_list_schemas(sr_session_ctx_t *session, sr_schema_t **schemas, size_t 
 {
     (void)session;
 
-    *schema_cnt = 4;
+    *schema_cnt = 7;
 
-    *schemas = calloc(4, sizeof **schemas);
+    *schemas = calloc(*schema_cnt, sizeof **schemas);
 
     (*schemas)[0].module_name = strdup("ietf-netconf-server");
     (*schemas)[0].installed = 1;
@@ -106,6 +106,36 @@ __wrap_sr_list_schemas(sr_session_ctx_t *session, sr_schema_t **schemas, size_t 
     (*schemas)[3].revision.revision = strdup("2014-05-08");
     (*schemas)[3].revision.file_path_yin = strdup(TESTS_DIR"/files/iana-if-type.yin");
     (*schemas)[3].installed = 1;
+
+    (*schemas)[4].module_name = strdup("test-feature-c");
+    (*schemas)[4].ns = strdup("urn:ietf:params:xml:ns:yang:test-feature-c");
+    (*schemas)[4].prefix = strdup("tfc");
+    (*schemas)[4].revision.revision = strdup("2018-05-18");
+    (*schemas)[4].revision.file_path_yin = strdup(TESTS_DIR"/files/test-feature-c.yin");
+    (*schemas)[4].enabled_features = malloc(sizeof(char *));
+    (*schemas)[4].enabled_features[0] = strdup("test-feature-c");
+    (*schemas)[4].enabled_feature_cnt = 1;
+    (*schemas)[4].installed = 1;
+
+    (*schemas)[5].module_name = strdup("test-feature-b");
+    (*schemas)[5].ns = strdup("urn:ietf:params:xml:ns:yang:test-feature-b");
+    (*schemas)[5].prefix = strdup("tfb");
+    (*schemas)[5].revision.revision = strdup("2018-05-18");
+    (*schemas)[5].revision.file_path_yin = strdup(TESTS_DIR"/files/test-feature-b.yin");
+    (*schemas)[5].enabled_features = malloc(sizeof(char *));
+    (*schemas)[5].enabled_features[0] = strdup("test-feature-b");
+    (*schemas)[5].enabled_feature_cnt = 1;
+    (*schemas)[5].installed = 1;
+
+    (*schemas)[6].module_name = strdup("test-feature-a");
+    (*schemas)[6].ns = strdup("urn:ietf:params:xml:ns:yang:test-feature-a");
+    (*schemas)[6].prefix = strdup("tfa");
+    (*schemas)[6].revision.revision = strdup("2018-05-18");
+    (*schemas)[6].revision.file_path_yin = strdup(TESTS_DIR"/files/test-feature-a.yin");
+    (*schemas)[6].enabled_features = malloc(sizeof(char *));
+    (*schemas)[6].enabled_features[0] = strdup("test-feature-a");
+    (*schemas)[6].enabled_feature_cnt = 1;
+    (*schemas)[6].installed = 1;
 
     return SR_ERR_OK;
 }
@@ -208,7 +238,7 @@ __wrap_sr_get_item_next(sr_session_ctx_t *session, sr_val_iter_t *iter, sr_val_t
     char *path;
     (void)session;
 
-    if (!strcmp(xpath, "/ietf-interfaces:*//.")) {
+    if (!strcmp(xpath, "/ietf-interfaces:*//.") || !strcmp(xpath, "/test-feature-c:*//.")) {
         if (!ietf_if_set) {
             ietf_if_set = lyd_find_path(data, xpath);
         }
@@ -266,7 +296,7 @@ __wrap_sr_set_item(sr_session_ctx_t *session, const char *xpath, const sr_val_t 
     case SR_LEAF_EMPTY_T:
         ly_errno = LY_SUCCESS;
         lyd_new_path(data, np2srv.ly_ctx, xpath, NULL, 0, opt);
-        if ((ly_errno == LY_EVALID) && (ly_vecode == LYVE_PATH_EXISTS)) {
+        if ((ly_errno == LY_EVALID) && (ly_vecode(np2srv.ly_ctx) == LYVE_PATH_EXISTS)) {
             return SR_ERR_DATA_EXISTS;
         }
         assert_int_equal(ly_errno, LY_SUCCESS);
@@ -274,7 +304,7 @@ __wrap_sr_set_item(sr_session_ctx_t *session, const char *xpath, const sr_val_t 
     default:
         ly_errno = LY_SUCCESS;
         lyd_new_path(data, np2srv.ly_ctx, xpath, op_get_srval(np2srv.ly_ctx, (sr_val_t *)value, buf), 0, opt);
-        if ((ly_errno == LY_EVALID) && (ly_vecode == LYVE_PATH_EXISTS)) {
+        if ((ly_errno == LY_EVALID) && (ly_vecode(np2srv.ly_ctx) == LYVE_PATH_EXISTS)) {
             return SR_ERR_DATA_EXISTS;
         }
         assert_int_equal(ly_errno, LY_SUCCESS);
@@ -379,6 +409,14 @@ __wrap_sr_check_exec_permission(sr_session_ctx_t *session, const char *xpath, bo
     (void)session;
     (void)xpath;
     *permitted = true;
+    return SR_ERR_OK;
+}
+
+int
+__wrap_sr_session_set_options(sr_session_ctx_t *session, const sr_sess_options_t opts)
+{
+    (void)session;
+    (void)opts;
     return SR_ERR_OK;
 }
 
@@ -1102,7 +1140,7 @@ test_edit_create3(void **state)
 }
 
 static void
-test_edit_merge(void **state)
+test_edit_merge1(void **state)
 {
     (void)state; /* unused */
     const char *get_config_rpc =
@@ -1309,6 +1347,135 @@ test_edit_merge(void **state)
 }
 
 static void
+test_edit_merge2(void **state)
+{
+    (void)state; /* unused */
+    const char *get_config_rpc =
+    "<rpc msgid=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">"
+        "<get-config>"
+            "<source>"
+                "<running/>"
+            "</source>"
+        "</get-config>"
+    "</rpc>";
+    const char *get_config_rpl =
+    "<rpc-reply msgid=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">"
+        "<data xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">"
+"<interfaces xmlns=\"urn:ietf:params:xml:ns:yang:ietf-interfaces\">"
+  "<interface>"
+    "<name>iface2</name>"
+    "<description>iface2 dsc</description>"
+    "<type xmlns:ianaift=\"urn:ietf:params:xml:ns:yang:iana-if-type\">ianaift:softwareLoopback</type>"
+    "<enabled>false</enabled>"
+    "<link-up-down-trap-enable>disabled</link-up-down-trap-enable>"
+    "<ipv4 xmlns=\"urn:ietf:params:xml:ns:yang:ietf-ip\">"
+      "<address>"
+        "<ip>10.0.0.5</ip>"
+        "<netmask>255.0.0.0</netmask>"
+      "</address>"
+      "<address>"
+        "<ip>172.0.0.5</ip>"
+        "<prefix-length>16</prefix-length>"
+      "</address>"
+      "<neighbor>"
+        "<ip>10.0.0.1</ip>"
+        "<link-layer-address>01:34:56:78:9a:bc:de:fa</link-layer-address>"
+      "</neighbor>"
+    "</ipv4>"
+    "<ipv6 xmlns=\"urn:ietf:params:xml:ns:yang:ietf-ip\">"
+      "<address>"
+        "<ip>2001:abcd:ef01:2345:6789:0:1:5</ip>"
+        "<prefix-length>64</prefix-length>"
+      "</address>"
+      "<neighbor>"
+        "<ip>2001:abcd:ef01:2345:6789:0:1:1</ip>"
+        "<link-layer-address>01:34:56:78:9a:bc:de:fa</link-layer-address>"
+      "</neighbor>"
+      "<dup-addr-detect-transmits>100</dup-addr-detect-transmits>"
+      "<autoconf>"
+        "<create-global-addresses>true</create-global-addresses>"
+        "<create-temporary-addresses>false</create-temporary-addresses>"
+        "<temporary-valid-lifetime>600</temporary-valid-lifetime>"
+        "<temporary-preferred-lifetime>300</temporary-preferred-lifetime>"
+      "</autoconf>"
+    "</ipv6>"
+  "</interface>"
+  "<interface>"
+    "<name>iface1</name>"
+    "<description>iface1 dsc</description>"
+    "<type xmlns:ianaift=\"urn:ietf:params:xml:ns:yang:iana-if-type\">ianaift:ethernetCsmacd</type>"
+    "<enabled>true</enabled>"
+    "<ipv4 xmlns=\"urn:ietf:params:xml:ns:yang:ietf-ip\">"
+      "<enabled>true</enabled>"
+      "<forwarding>true</forwarding>"
+      "<mtu>68</mtu>"
+      "<address>"
+        "<ip>10.0.0.1</ip>"
+        "<netmask>255.0.0.0</netmask>"
+      "</address>"
+      "<address>"
+        "<ip>172.0.0.1</ip>"
+        "<prefix-length>16</prefix-length>"
+      "</address>"
+      "<neighbor>"
+        "<ip>10.0.0.2</ip>"
+        "<link-layer-address>01:34:56:78:9a:bc:de:f0</link-layer-address>"
+      "</neighbor>"
+    "</ipv4>"
+    "<ipv6 xmlns=\"urn:ietf:params:xml:ns:yang:ietf-ip\">"
+      "<enabled>true</enabled>"
+      "<forwarding>false</forwarding>"
+      "<mtu>1280</mtu>"
+      "<address>"
+        "<ip>2001:abcd:ef01:2345:6789:0:1:1</ip>"
+        "<prefix-length>64</prefix-length>"
+      "</address>"
+      "<neighbor>"
+        "<ip>2001:abcd:ef01:2345:6789:0:1:2</ip>"
+        "<link-layer-address>01:34:56:78:9a:bc:de:f0</link-layer-address>"
+      "</neighbor>"
+      "<dup-addr-detect-transmits>52</dup-addr-detect-transmits>"
+      "<autoconf>"
+        "<create-global-addresses>true</create-global-addresses>"
+        "<create-temporary-addresses>false</create-temporary-addresses>"
+        "<temporary-valid-lifetime>600</temporary-valid-lifetime>"
+        "<temporary-preferred-lifetime>300</temporary-preferred-lifetime>"
+      "</autoconf>"
+    "</ipv6>"
+    "<link-up-down-trap-enable>disabled</link-up-down-trap-enable>"
+  "</interface>"
+"</interfaces>"
+"<test-container xmlns=\"urn:ietf:params:xml:ns:yang:test-feature-c\">"
+  "<test-leaf>green</test-leaf>"
+"</test-container>"
+        "</data>"
+    "</rpc-reply>";
+    const char *edit_rpc =
+    "<rpc msgid=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">"
+        "<edit-config>"
+            "<target>"
+                "<running/>"
+            "</target>"
+            "<config>"
+"<test-container xmlns=\"urn:ietf:params:xml:ns:yang:test-feature-c\">"
+  "<test-leaf>green</test-leaf>"
+"</test-container>"
+            "</config>"
+        "</edit-config>"
+    "</rpc>";
+    const char *edit_rpl =
+    "<rpc-reply msgid=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">"
+        "<ok/>"
+    "</rpc-reply>";
+
+    test_write(p_out, edit_rpc, __LINE__);
+    test_read(p_in, edit_rpl, __LINE__);
+
+    test_write(p_out, get_config_rpc, __LINE__);
+    test_read(p_in, get_config_rpl, __LINE__);
+}
+
+static void
 test_startstop(void **state)
 {
     (void)state; /* unused */
@@ -1327,7 +1494,8 @@ main(void)
                     cmocka_unit_test(test_edit_create1),
                     cmocka_unit_test(test_edit_create2),
                     cmocka_unit_test(test_edit_create3),
-                    cmocka_unit_test(test_edit_merge),
+                    cmocka_unit_test(test_edit_merge1),
+                    cmocka_unit_test(test_edit_merge2),
                     cmocka_unit_test_teardown(test_startstop, np_stop),
     };
 

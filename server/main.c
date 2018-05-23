@@ -13,8 +13,9 @@
  *     https://opensource.org/licenses/BSD-3-Clause
  */
 
-#define _BSD_SOURCE 1
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE 1
+#define _GNU_SOURCE
+
 #include <errno.h>
 #ifdef DEBUG
     #include <execinfo.h>
@@ -51,17 +52,6 @@ struct np2srv np2srv;
 struct np2srv_dslock dslock;
 pthread_rwlock_t dslock_rwl = PTHREAD_RWLOCK_INITIALIZER;
 
-static void *worker_thread(void *arg);
-
-int np_sleep(unsigned int miliseconds)
-{
-    struct timespec ts;
-
-    ts.tv_sec = miliseconds / 1000;
-    ts.tv_nsec = (miliseconds % 1000) * 1000000;
-    return nanosleep(&ts, NULL);
-}
-
 /**
  * @brief Control flags for the main loop
  */
@@ -72,6 +62,93 @@ enum LOOPCTRL {
 };
 /** @brief flag for main loop */
 volatile enum LOOPCTRL control = LOOP_CONTINUE;
+
+static void *worker_thread(void *arg);
+static void np2srv_feature_change_clb(const char *module_name, const char *feature_name, bool enabled, void *private_ctx);
+static void np2srv_module_install_clb(const char *module_name, const char *revision, sr_module_state_t state, void *private_ctx);
+
+int
+np2srv_sr_reconnect(void)
+{
+    int rc;
+    uint16_t i;
+    struct nc_session *nc_sess;
+    struct np2_sessions *np2_sess;
+
+    if (!np2srv.disconnected) {
+        sr_unsubscribe(np2srv.sr_sess.srs, np2srv.sr_subscr);
+        /* connection and all the sessions get freed */
+        sr_disconnect(np2srv.sr_conn);
+
+        /* TODO generate notif sysrepo down */
+        np2srv.disconnected = 1;
+    }
+
+    /* create new connection and sessions */
+    rc = sr_connect("netopeer2", SR_CONN_DAEMON_REQUIRED | SR_CONN_DAEMON_START, &np2srv.sr_conn);
+    if (rc != SR_ERR_OK) {
+        goto finish;
+    }
+
+    /* server session */
+    rc = sr_session_start(np2srv.sr_conn, np2srv.sr_sess.ds, np2srv.sr_sess.opts, &np2srv.sr_sess.srs);
+    if (rc != SR_ERR_OK) {
+        goto finish;
+    }
+
+    /* subscribe for notifications about new modules */
+    rc = sr_module_install_subscribe(np2srv.sr_sess.srs, np2srv_module_install_clb, NULL, 0, &np2srv.sr_subscr);
+    if (rc != SR_ERR_OK) {
+        goto finish;
+    }
+
+    /* subscribe for changes of features state */
+    rc = sr_feature_enable_subscribe(np2srv.sr_sess.srs, np2srv_feature_change_clb, NULL, SR_SUBSCR_CTX_REUSE, &np2srv.sr_subscr);
+    if (rc != SR_ERR_OK) {
+        goto finish;
+    }
+
+    /* client sessions, client subscriptions are stored in persistent files, no need to make them again */
+    for (i = 0; (nc_sess = nc_ps_get_session(np2srv.nc_ps, i)); ++i) {
+        np2_sess = (struct np2_sessions *)nc_session_get_data(nc_sess);
+        rc = sr_session_start_user(np2srv.sr_conn, nc_session_get_username(nc_sess), np2_sess->ds, np2_sess->opts, &np2_sess->srs);
+        if (rc != SR_ERR_OK) {
+            goto finish;
+        }
+    }
+
+finish:
+    switch (rc) {
+    case SR_ERR_DISCONNECT:
+        ERR("Failed to connect to sysrepod, it will be retried on the next communication with sysrepo.");
+        rc = -1;
+        break;
+    case SR_ERR_OK:
+        if (np2srv.disconnected) {
+            /* TODO generate notif sysrepo up */
+            np2srv.disconnected = 0;
+        }
+        rc = 0;
+        break;
+    default:
+        ERR("Failed to connect to sysrepod (%s), exiting.", sr_strerror(rc));
+        control = LOOP_STOP;
+        rc = -1;
+        break;
+    }
+
+    return rc;
+}
+
+int
+np_sleep(unsigned int miliseconds)
+{
+    struct timespec ts;
+
+    ts.tv_sec = miliseconds / 1000;
+    ts.tv_nsec = (miliseconds % 1000) * 1000000;
+    return nanosleep(&ts, NULL);
+}
 
 /**
  * @brief Print version information to the stdout.
@@ -86,11 +163,7 @@ print_version(void)
 /**
  * @brief Command line options definition for getopt()
  */
-#ifndef NDEBUG
-#   define OPTSTRING "dhv:Vc:"
-#else
-#   define OPTSTRING "dhv:V"
-#endif
+#define OPTSTRING "dhv:Vc:"
 /**
  * @brief Print command line options description
  * @param[in] progname Name of the process.
@@ -110,6 +183,8 @@ print_usage(char* progname)
 #ifndef NDEBUG
     fprintf(stdout, " -c category[,category]*  verbose debug level, print only these debug message categories\n");
     fprintf(stdout, " categories: DICT, YANG, YIN, XPATH, DIFF, MSG, EDIT_CONFIG, SSH, SYSREPO\n");
+#else
+    fprintf(stdout, " -c category[,category]*  verbose debug level, NOT SUPPORTED in release build type\n");
 #endif
     fprintf(stdout, "\n");
 }
@@ -152,8 +227,8 @@ signal_handler(int sig)
         depth = backtrace(stack_buf, STACK_DEPTH);
         fprintf(stderr, "Segmentation fault, backtrace:\n");
         backtrace_symbols_fd(stack_buf, depth, STDERR_FILENO);
-        /* fall through */
 #endif
+        /* fall through */
     default:
         exit(EXIT_FAILURE);
     }
@@ -265,24 +340,16 @@ np2srv_ly_import_clb(const char *mod_name, const char *mod_rev, const char *subm
                      void *UNUSED(user_data), LYS_INFORMAT *format, void (**free_module_data)(void *model_data))
 {
     char *data = NULL;
-    int rc;
 
     *free_module_data = free;
     *format = LYS_YIN;
     if (submod_rev || (submod_name && !mod_name)) {
-        rc = sr_get_submodule_schema(np2srv.sr_sess.srs, submod_name, submod_rev, SR_SCHEMA_YIN, &data);
+        np2srv_sr_get_submodule_schema(np2srv.sr_sess.srs, submod_name, submod_rev, SR_SCHEMA_YIN, &data, NULL);
     } else {
-        rc = sr_get_schema(np2srv.sr_sess.srs, mod_name, mod_rev, submod_name, SR_SCHEMA_YIN, &data);
-    }
-    if (rc == SR_ERR_OK) {
-        return data;
-    } else if (submod_name) {
-        ERR("Unable to get %s module from sysrepo (%s).", submod_name, sr_strerror(rc));
-    } else {
-        ERR("Unable to get %s module from sysrepo (%s).", mod_name, sr_strerror(rc));
+        np2srv_sr_get_schema(np2srv.sr_sess.srs, mod_name, mod_rev, submod_name, SR_SCHEMA_YIN, &data, NULL);
     }
 
-    return NULL;
+    return data;
 }
 
 static void
@@ -290,7 +357,7 @@ np2srv_send_capab_change_notif(const char *added_uri, const char *deleted_uri, c
 {
     sr_val_t *data;
 
-    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", NULL)) {
+    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", NULL, 1)) {
         return;
     }
 
@@ -317,10 +384,11 @@ np2srv_send_capab_change_notif(const char *added_uri, const char *deleted_uri, c
         data[2].data.string_val = (char *)modified_uri;
     }
 
-    sr_event_notif_send(np2srv.sr_sess.srs, "/ietf-netconf-notifications:netconf-capability-change", data,
-                        3, SR_EV_NOTIF_DEFAULT);
+    if (!np2srv_sr_event_notif_send(np2srv.sr_sess.srs, "/ietf-netconf-notifications:netconf-capability-change", data,
+                                    3, SR_EV_NOTIF_DEFAULT, NULL)) {
+        VRB("Generated new event (netconf-capability-change).");
+    }
     free(data);
-    VRB("Generated new event (netconf-capability-change).");
 }
 
 static char *
@@ -368,24 +436,21 @@ np2srv_create_capab(const struct lys_module *mod)
 static void
 np2srv_module_install_clb(const char *module_name, const char *revision, sr_module_state_t state, void *UNUSED(private_ctx))
 {
-    int rc;
     char *data = NULL, *cpb;
     const struct lys_module *mod;
     struct lyd_node *info;
     sr_schema_t *schemas = NULL;
     size_t count, i, j;
 
-    if (!strcmp(module_name, "ietf-yang-library")) {
-        /* this module is completely managed by sysrepo, ignore this */
+    if (!strcmp(module_name, "ietf-yang-library") || (state == SR_MS_IMPORTED)) {
+        /* yang-library module is completely managed by sysrepo, ignore this,
+         * imported module will either be loaded when parsing an imported module or it should not be needed */
         return;
     }
 
     if (state == SR_MS_IMPLEMENTED) {
         /* adding another module into the current libyang context */
-        rc = sr_get_schema(np2srv.sr_sess.srs, module_name, revision, NULL, SR_SCHEMA_YIN, &data);
-        if (rc != SR_ERR_OK) {
-            ERR("Unable to get installed module %s%s%s from sysrepo (%s), schema won't be available.", module_name,
-                revision ? "@" : "", revision ? revision : "", sr_strerror(rc));
+        if (np2srv_sr_get_schema(np2srv.sr_sess.srs, module_name, revision, NULL, SR_SCHEMA_YIN, &data, NULL)) {
             return;
         }
 
@@ -397,15 +462,14 @@ np2srv_module_install_clb(const char *module_name, const char *revision, sr_modu
         free(data);
 
         if (!mod) {
-            ERR("Unable to parse installed module %s%s%s from sysrepo (%s), schema won't be available.", module_name,
-                revision ? "@" : "", revision ? revision : "", sr_strerror(rc));
+            pthread_rwlock_unlock(&np2srv.ly_ctx_lock);
+            ERR("Unable to parse installed module %s%s%s from sysrepo, schema won't be available.", module_name,
+                revision ? "@" : "", revision ? revision : "");
+            return;
         } else {
             /* get module's features */
-            rc = sr_list_schemas(np2srv.sr_sess.srs, &schemas, &count);
-            if (rc != SR_ERR_OK) {
+            if (np2srv_sr_list_schemas(np2srv.sr_sess.srs, &schemas, &count, NULL)) {
                 pthread_rwlock_unlock(&np2srv.ly_ctx_lock);
-                ERR("Unable to get list of sysrepo schemas for %s%s%s module feature (%s).", module_name,
-                    revision ? "@" : "", revision ? revision : "", sr_strerror(rc));
                 return;
             }
 
@@ -426,8 +490,6 @@ np2srv_module_install_clb(const char *module_name, const char *revision, sr_modu
             np2srv_send_capab_change_notif(cpb, NULL, NULL);
             free(cpb);
         }
-    } else if (state == SR_MS_IMPORTED) {
-        /* TODO nothing to do, it will either be loaded when parsing an imported module or it should not be needed, right? */
     } else {
         VRB("Removing schema \"%s%s%s\" according to changes in sysrepo.", module_name, revision ? "@" : "",
             revision ? revision : "");
@@ -436,7 +498,7 @@ np2srv_module_install_clb(const char *module_name, const char *revision, sr_modu
         pthread_rwlock_wrlock(&np2srv.ly_ctx_lock);
 
         /* remove the specified module from the context */
-        mod = ly_ctx_get_module(np2srv.ly_ctx, module_name, revision);
+        mod = ly_ctx_get_module(np2srv.ly_ctx, module_name, revision, 0);
         cpb = np2srv_create_capab(mod);
         /* the function can fail in case the module was already removed
          * because of dependency in some of the previous calls */
@@ -469,7 +531,7 @@ np2srv_feature_change_clb(const char *module_name, const char *feature_name, boo
     /* lock for modifying libyang context */
     pthread_rwlock_wrlock(&np2srv.ly_ctx_lock);
 
-    mod = ly_ctx_get_module(np2srv.ly_ctx, module_name, NULL);
+    mod = ly_ctx_get_module(np2srv.ly_ctx, module_name, NULL, 0);
     if (!mod) {
         pthread_rwlock_unlock(&np2srv.ly_ctx_lock);
         ERR("Sysrepo module %s to change feature %s does not present in Netopeer2.", module_name, feature_name);
@@ -492,7 +554,6 @@ static int
 connect_ds(struct nc_session *ncs)
 {
     struct np2_sessions *s;
-    int rc;
 
     if (!ncs) {
         return EXIT_FAILURE;
@@ -506,10 +567,8 @@ connect_ds(struct nc_session *ncs)
     s->ncs = ncs;
     s->ds = SR_DS_RUNNING;
     s->opts = SR_SESS_ENABLE_NACM;
-    rc = sr_session_start_user(np2srv.sr_conn, nc_session_get_username(ncs), s->ds, s->opts, &s->srs);
-    if (rc != SR_ERR_OK) {
-        ERR("Unable to create sysrepo session for NETCONF session %d (%s; datastore %d; options %d).",
-            nc_session_get_id(ncs), sr_strerror(rc), s->ds, s->opts);
+
+    if (np2srv_sr_session_start_user(nc_session_get_username(ncs), s->ds, s->opts, &s->srs, NULL)) {
         goto error;
     }
 
@@ -520,7 +579,7 @@ connect_ds(struct nc_session *ncs)
 
 error:
     if (s->srs) {
-        sr_session_stop(s->srs);
+        np2srv_sr_session_stop(s->srs, NULL);
     }
     free(s);
     return EXIT_FAILURE;
@@ -577,7 +636,7 @@ np2srv_new_session_clb(const char *UNUSED(client_name), struct nc_session *new_s
         nc_session_free(new_session, free_ds);
     }
 
-    if ((mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", NULL)) && mod->implemented) {
+    if ((mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", NULL, 1))) {
         /* generate ietf-netconf-notification's netconf-session-start event for sysrepo */
         host = (char*)nc_session_get_host(new_session);
         event_data = calloc(host ? 3 : 2, sizeof *event_data);
@@ -592,11 +651,11 @@ np2srv_new_session_clb(const char *UNUSED(client_name), struct nc_session *new_s
             event_data[2].type = SR_STRING_T;
             event_data[2].data.string_val = host;
         }
-        sr_event_notif_send(np2srv.sr_sess.srs, "/ietf-netconf-notifications:netconf-session-start", event_data,
-                            host ? 3 : 2, SR_EV_NOTIF_DEFAULT);
+        if (!np2srv_sr_event_notif_send(np2srv.sr_sess.srs, "/ietf-netconf-notifications:netconf-session-start", event_data,
+                                        host ? 3 : 2, SR_EV_NOTIF_DEFAULT, NULL)) {
+            VRB("Generated new event (netconf-session-start).");
+        }
         free(event_data);
-
-        VRB("Generated new event (netconf-session-start).");
     }
 }
 
@@ -631,7 +690,7 @@ np2srv_del_session_clb(struct nc_session *session)
         break;
     }
 
-    if ((mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", NULL)) && mod->implemented) {
+    if ((mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", NULL, 1))) {
         /* generate ietf-netconf-notification's netconf-session-end event for sysrepo */
         host = (char *)nc_session_get_host(session);
         c = 3;
@@ -678,83 +737,98 @@ np2srv_del_session_clb(struct nc_session *session)
             event_data[i++].data.enum_val = "other";
             break;
         }
-        sr_event_notif_send(np2srv.sr_sess.srs, "/ietf-netconf-notifications:netconf-session-end", event_data, c,
-                            SR_EV_NOTIF_DEFAULT);
+        if (!np2srv_sr_event_notif_send(np2srv.sr_sess.srs, "/ietf-netconf-notifications:netconf-session-end", event_data, c,
+                                        SR_EV_NOTIF_DEFAULT, NULL)) {
+            VRB("Generated new event (netconf-session-end).");
+        }
         free(event_data);
-
-        VRB("Generated new event (netconf-session-end).");
     }
 
     nc_session_free(session, free_ds);
 }
 
 static int
-np2srv_init_schemas(int first)
+np2srv_init_schemas(void)
 {
     int rc;
     char *data = NULL;
     const struct lys_module *mod;
     sr_schema_t *schemas = NULL;
-    size_t count, i, j;
+    size_t schema_count, i, j;
+    int ly_lo;
+
+    size_t module_feature_count = 0;
+    struct mod_feat {
+        const struct lys_module *mod;
+        const char *enabled_feature;
+    };
+    struct mod_feat *mod_feat_array;
+    size_t mod_feat_array_index;
+    bool making_progress;
 
     /* get the list of schemas from sysrepo */
-    rc = sr_list_schemas(np2srv.sr_sess.srs, &schemas, &count);
-    if (rc != SR_ERR_OK) {
-        ERR("Unable to get list of schemas supported by sysrepo (%s).", sr_strerror(rc));
-        return EXIT_FAILURE;
+    if (np2srv_sr_list_schemas(np2srv.sr_sess.srs, &schemas, &schema_count, NULL)) {
+        return -1;
     }
 
-    if (first) {
-        /* subscribe for notifications about new modules */
-        rc = sr_module_install_subscribe(np2srv.sr_sess.srs, np2srv_module_install_clb, NULL, 0, &np2srv.sr_subscr);
-        if (rc != SR_ERR_OK) {
-            ERR("Unable to subscribe for sysrepo module installation notifications (%s)", sr_strerror(rc));
-            goto error;
-        }
-        /* subscribe for changes of features state */
-        rc = sr_feature_enable_subscribe(np2srv.sr_sess.srs, np2srv_feature_change_clb, NULL, SR_SUBSCR_CTX_REUSE, &np2srv.sr_subscr);
-        if (rc != SR_ERR_OK) {
-            ERR("Unable to subscribe for sysrepo module feature change notifications (%s)", sr_strerror(rc));
-            goto error;
-        }
+    /* subscribe for notifications about new modules */
+    rc = sr_module_install_subscribe(np2srv.sr_sess.srs, np2srv_module_install_clb, NULL, 0, &np2srv.sr_subscr);
+    if (rc != SR_ERR_OK) {
+        ERR("Subscribing to module install failed (%s).", sr_strerror(rc));
+        goto error;
+    }
 
-        /* init rwlock for libyang context */
+    /* subscribe for changes of features state */
+    rc = sr_feature_enable_subscribe(np2srv.sr_sess.srs, np2srv_feature_change_clb, NULL, SR_SUBSCR_CTX_REUSE, &np2srv.sr_subscr);
+    if (rc != SR_ERR_OK) {
+        ERR("Subscribing to feature enable failed (%s).", sr_strerror(rc));
+        goto error;
+    }
+
+    /* init rwlock for libyang context */
 #ifdef HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
-        pthread_rwlockattr_t attr;
-        rc = pthread_rwlockattr_init(&attr);
-        if (rc) {
-            ERR("Initiating schema context lock attributes failed (%s)", strerror(rc));
-            goto error;
-        }
-        /* prefer write locks */
-        pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
-        rc = pthread_rwlock_init(&np2srv.ly_ctx_lock, &attr);
-        pthread_rwlockattr_destroy(&attr);
+    pthread_rwlockattr_t attr;
+    rc = pthread_rwlockattr_init(&attr);
+    if (rc) {
+        ERR("Initiating schema context lock attributes failed (%s)", strerror(rc));
+        goto error;
+    }
+    /* prefer write locks */
+    pthread_rwlockattr_setkind_np(&attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+    rc = pthread_rwlock_init(&np2srv.ly_ctx_lock, &attr);
+    pthread_rwlockattr_destroy(&attr);
 #else
-        rc = pthread_rwlock_init(&np2srv.ly_ctx_lock, NULL);
+    rc = pthread_rwlock_init(&np2srv.ly_ctx_lock, NULL);
 #endif
-        if (rc) {
-            ERR("Initiating schema context lock failed (%s)", strerror(rc));
-            goto error;
-        }
+    if (rc) {
+        ERR("Initiating schema context lock failed (%s)", strerror(rc));
+        goto error;
     }
 
     /* build libyang context */
     /* the lock is not supposed to be locked here. In case of first calling, it needn't be used because we are still
      * single-threaded, in other cases the caller (np2srv_module_install_clb()) is supposed to lock it */
-    np2srv.ly_ctx = ly_ctx_new(NULL);
+    np2srv.ly_ctx = ly_ctx_new(NULL, 0);
     if (!np2srv.ly_ctx) {
         goto error;
     }
     ly_ctx_set_module_imp_clb(np2srv.ly_ctx, np2srv_ly_import_clb, NULL);
 
+    /* determine the count of module/features present */
+    module_feature_count = 0;
+    for (i = 0; i < schema_count; i++) {
+        module_feature_count += schemas[i].enabled_feature_cnt;
+    }
+    /* prepare data storage to keep module/feature enable status */
+    mod_feat_array = calloc(module_feature_count, sizeof *mod_feat_array);
+    mod_feat_array_index = 0;
+
     /* 1) use modules from sysrepo */
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < schema_count; i++) {
         data = NULL;
-        mod = NULL;
         VRB("Loading schema \"%s%s%s\" from sysrepo.", schemas[i].module_name, schemas[i].revision.revision ? "@" : "",
             schemas[i].revision.revision ? schemas[i].revision.revision : "");
-        if ((mod = ly_ctx_get_module(np2srv.ly_ctx, schemas[i].module_name, schemas[i].revision.revision))) {
+        if ((mod = ly_ctx_get_module(np2srv.ly_ctx, schemas[i].module_name, schemas[i].revision.revision, 0))) {
             VRB("Module %s%s%s already present in context.", schemas[i].module_name,
                 schemas[i].revision.revision ? "@" : "",
                 schemas[i].revision.revision ? schemas[i].revision.revision : "");
@@ -763,32 +837,72 @@ np2srv_init_schemas(int first)
                     schemas[i].module_name, schemas[i].revision.revision ? "@" : "",
                     schemas[i].revision.revision ? schemas[i].revision.revision : "");
             }
-        } else if (sr_get_schema(np2srv.sr_sess.srs, schemas[i].module_name,
-                                 schemas[i].revision.revision, NULL, SR_SCHEMA_YIN, &data) == SR_ERR_OK) {
+        } else if (!np2srv_sr_get_schema(np2srv.sr_sess.srs, schemas[i].module_name,
+                schemas[i].revision.revision, NULL, SR_SCHEMA_YIN, &data, NULL)) {
             mod = lys_parse_mem(np2srv.ly_ctx, data, LYS_IN_YIN);
             free(data);
         }
 
-        if (!mod) {
+        if (mod) {
+            /* set RPC and Notifications callbacks */
+            np2srv_module_assign_clbs(mod);
+
+            /* set features according to sysrepo (silent errors, there can be some other dependent features not enabled yet) */
+            ly_lo = ly_log_options(0);
+            for (j = 0; j < schemas[i].enabled_feature_cnt; ++j) {
+                /* if lys_features_enable fail (silently), record the mod_feat for retry otherwise store NULL */
+
+                if (lys_features_enable(mod, schemas[i].enabled_features[j])) {
+                    /* store away info related to feature that did not enable on first pass */
+                    mod_feat_array[mod_feat_array_index].mod = mod;
+                    mod_feat_array[mod_feat_array_index].enabled_feature = schemas[i].enabled_features[j];
+                }
+                mod_feat_array_index++;
+            }
+            /* restore libyang logging */
+            ly_log_options(ly_lo);
+        } else {
             WRN("Getting %s%s%s schema from sysrepo failed, data from this module won't be available.",
                 schemas[i].module_name, schemas[i].revision.revision ? "@" : "",
                 schemas[i].revision.revision ? schemas[i].revision.revision : "");
-        } else {
-            /* set features according to sysrepo */
-            for (j = 0; j < schemas[i].enabled_feature_cnt; ++j) {
-                lys_features_enable(mod, schemas[i].enabled_features[j]);
-            }
-
-            /* set RPC and Notifications callbacks */
-            np2srv_module_assign_clbs(mod);
         }
     }
+
+    /* we may be able to get features enabled now that others are enabled so we will
+       run through our stored module_features and retry the ones on our list
+       we will continue until a pass through the array doesn't indicate progress */
+    ly_lo = ly_log_options(0);
+    do {
+        making_progress = false;
+        for (i = 0; i < module_feature_count; i++) {
+            if (mod_feat_array[i].mod) {
+                if (!lys_features_enable(mod_feat_array[i].mod, mod_feat_array[i].enabled_feature)) {
+                    /* feature enabled, remove from list and set making_progress TRUE */
+                    making_progress = true;
+                    mod_feat_array[i].mod = NULL;
+                    mod_feat_array[i].enabled_feature = NULL;
+                }
+            }
+        }
+    } while (making_progress);
+    ly_log_options(ly_lo);
+
+    /* now pass through the mod_feat_array and report errors on any remaining entries
+       as they are not enabled */
+    for (i = 0; i < module_feature_count; i++) {
+        if (mod_feat_array[i].mod) {
+            lys_features_enable(mod_feat_array[i].mod, mod_feat_array[i].enabled_feature);
+        }
+    }
+
+    free(mod_feat_array);
+
     ly_ctx_set_module_imp_clb(np2srv.ly_ctx, np2srv_ly_import_clb, NULL);
-    sr_free_schemas(schemas, count);
+    sr_free_schemas(schemas, schema_count);
     schemas = NULL;
 
     /* 2) add internally used schemas: ietf-netconf, ... */
-    mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf", "2011-06-01");
+    mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf", "2011-06-01", 1);
     if (!mod && !(mod = lys_parse_mem(np2srv.ly_ctx, (const char *)ietf_netconf_2011_06_01_yin, LYS_IN_YIN))) {
         goto error;
     }
@@ -802,27 +916,27 @@ np2srv_init_schemas(int first)
     lys_features_enable(mod, "xpath");
 
     /* ... ietf-netconf-monitoring (leave get-schema RPC empty, libnetconf2 will use its callback), */
-    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-monitoring", "2010-10-04") &&
+    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-monitoring", "2010-10-04", 1) &&
             !lys_parse_mem(np2srv.ly_ctx, (const char *)ietf_netconf_monitoring_yin, LYS_IN_YIN)) {
         goto error;
     }
 
     /* ... ietf-netconf-with-defaults */
-    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-with-defaults", "2011-06-01") &&
+    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-with-defaults", "2011-06-01", 1) &&
             !lys_parse_mem(np2srv.ly_ctx, (const char *)ietf_netconf_with_defaults_2011_06_01_yin, LYS_IN_YIN)) {
         goto error;
     }
 
     /* ... notifications, nc-notifications, and ietf-netconf-notifications */
-    if (!ly_ctx_get_module(np2srv.ly_ctx, "notifications", "2008-07-14") &&
+    if (!ly_ctx_get_module(np2srv.ly_ctx, "notifications", "2008-07-14", 1) &&
             !lys_parse_mem(np2srv.ly_ctx, (const char *)notifications_2008_07_14_yin, LYS_IN_YIN)) {
         goto error;
     }
-    if (!ly_ctx_get_module(np2srv.ly_ctx, "nc-notifications", "2008-07-14") &&
+    if (!ly_ctx_get_module(np2srv.ly_ctx, "nc-notifications", "2008-07-14", 1) &&
             !lys_parse_mem(np2srv.ly_ctx, (const char *)nc_notifications_2008_07_14_yin, LYS_IN_YIN)) {
         goto error;
     }
-    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", "2012-02-06") &&
+    if (!ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-notifications", "2012-02-06", 1) &&
             !lys_parse_mem(np2srv.ly_ctx, (const char *)ietf_netconf_notifications_2012_02_06_yin, LYS_IN_YIN)) {
         goto error;
     }
@@ -833,14 +947,14 @@ np2srv_init_schemas(int first)
     lyd_free(ylib);
     */
 
-    return EXIT_SUCCESS;
+    return 0;
 
 error:
     if (schemas) {
-        sr_free_schemas(schemas, count);
+        sr_free_schemas(schemas, schema_count);
     }
     ly_ctx_destroy(np2srv.ly_ctx, NULL);
-    return EXIT_FAILURE;
+    return -1;
 }
 
 static int
@@ -859,30 +973,30 @@ np2srv_default_hostkey_clb(const char *name, void *UNUSED(user_data), char **pri
 static int
 server_init(void)
 {
-    int rc;
     const struct lys_node *snode;
     const struct lys_module *mod;
+    int rc;
 
     /* connect to the sysrepo */
     rc = sr_connect("netopeer2", SR_CONN_DAEMON_REQUIRED | SR_CONN_DAEMON_START, &np2srv.sr_conn);
     if (rc != SR_ERR_OK) {
-        ERR("Unable to connect to sysrepod (%s).", sr_strerror(rc));
-        return EXIT_FAILURE;
+        ERR("Connecting to sysrepo failed (%s).", sr_strerror(rc));
+        goto error;
     }
 
-    VRB("Netopeer2 connected to sysrepod.");
-
-    /* start internal sessions with sysrepo */
+    /* server session */
     np2srv.sr_sess.ds = SR_DS_STARTUP;
     np2srv.sr_sess.opts = SR_SESS_DEFAULT;
     rc = sr_session_start(np2srv.sr_conn, np2srv.sr_sess.ds, np2srv.sr_sess.opts, &np2srv.sr_sess.srs);
     if (rc != SR_ERR_OK) {
-        ERR("Unable to create Netopeer session with sysrepod (%s).", sr_strerror(rc));
-        return EXIT_FAILURE;
+        ERR("Creating sysrepo session failed (%s).", sr_strerror(rc));
+        goto error;
     }
 
+    VRB("Netopeer2 connected to sysrepod.");
+
     /* init libyang context with schemas */
-    if (np2srv_init_schemas(1)) {
+    if (np2srv_init_schemas()) {
         goto error;
     }
 
@@ -894,15 +1008,15 @@ server_init(void)
         goto error;
     }
 
+    /* prepare poll session structure for libnetconf2 */
+    np2srv.nc_ps = nc_ps_new();
+
     /* set with-defaults capability basic-mode */
     nc_server_set_capab_withdefaults(NC_WD_EXPLICIT, NC_WD_ALL | NC_WD_ALL_TAG | NC_WD_TRIM | NC_WD_EXPLICIT);
 
     /* set capabilities for the NETCONF Notifications */
     nc_server_set_capability("urn:ietf:params:netconf:capability:notification:1.0");
     nc_server_set_capability("urn:ietf:params:netconf:capability:interleave:1.0");
-
-    /* prepare poll session structure for libnetconf2 */
-    np2srv.nc_ps = nc_ps_new();
 
     /* set NETCONF operations callbacks */
     snode = ly_ctx_get_node(np2srv.ly_ctx, NULL, "/ietf-netconf:get-config", 0);
@@ -950,20 +1064,22 @@ server_init(void)
     nc_set_rpc_callback(snode, op_ntf_subscribe);
 
     /* set server options */
-    mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-server", NULL);
+    mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-netconf-server", NULL, 1);
     if (mod && strcmp(NP2SRV_KEYSTORED_DIR, "none")) {
+#ifdef ENABLED_TLS
         nc_server_tls_set_verify_clb(np2srv_verify_clb);
+#endif
         if (ietf_netconf_server_init(mod)) {
             goto error;
         }
 
-        mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-system", NULL);
+        mod = ly_ctx_get_module(np2srv.ly_ctx, "ietf-system", NULL, 1);
         if (mod) {
             if (ietf_system_init(mod)) {
                 goto error;
             }
         } else {
-            WRN("Sysrepo does not have the \"ietf-system\" module, SSH publickey authentication will not work.");
+            WRN("Sysrepo does not implement the \"ietf-system\" module, SSH publickey authentication will not work.");
         }
     } else {
         WRN("Sysrepo does not have the \"ietf-netconf-server\" module or keystored keys dir unknown, using default NETCONF server options.");
@@ -982,11 +1098,11 @@ server_init(void)
         }
     }
 
-    return EXIT_SUCCESS;
+    return 0;
 
 error:
     ERR("Server init failed.");
-    return EXIT_FAILURE;
+    return -1;
 }
 
 static void *
@@ -1022,8 +1138,8 @@ worker_thread(void *arg)
         /* listen for incoming requests on active NETCONF sessions */
         rc = nc_ps_poll(np2srv.nc_ps, 0, &ncs);
 
-        if (rc & (NC_PSPOLL_NOSESSIONS | NC_PSPOLL_TIMEOUT)) {
-            /* if there is no active session or timeout, rest for a while */
+        if (rc & (NC_PSPOLL_NOSESSIONS | NC_PSPOLL_TIMEOUT | NC_PSPOLL_ERROR)) {
+            /* if there is no active session, timeout, or an error, rest for a while */
             pthread_rwlock_unlock(&np2srv.ly_ctx_lock);
             np_sleep(10);
             continue;
@@ -1105,7 +1221,8 @@ main(int argc, char *argv[])
     pthread_attr_t thread_attr;
 
     /* until daemonized, write messages to both syslog and stderr */
-    openlog("netopeer2-server", LOG_PID | LOG_PERROR, LOG_DAEMON);
+    openlog("netopeer2-server", LOG_PID, LOG_DAEMON);
+    np2_stderr_log = 1;
 
     /* process command line options */
     while ((c = getopt(argc, argv, OPTSTRING)) != -1) {
@@ -1147,8 +1264,8 @@ main(int argc, char *argv[])
         case 'V':
             print_version();
             return EXIT_SUCCESS;
-#ifndef NDEBUG
         case 'c':
+#ifndef NDEBUG
             if (verb) {
                 ERR("Do not combine -v and -c parameters.");
                 return EXIT_FAILURE;
@@ -1187,7 +1304,7 @@ main(int argc, char *argv[])
                     return EXIT_FAILURE;
                 }
             } while ((ptr = strtok(NULL, ",")));
-            /* set final verbosity ofr libssh and libyang */
+            /* set final verbosity of libssh and libyang */
             nc_libssh_thread_verbosity(np2_libssh_verbose_level);
             if (verb) {
                 ly_verb(LY_LLDBG);
@@ -1195,6 +1312,9 @@ main(int argc, char *argv[])
             }
 
             verb = 1;
+            break;
+#else
+            WRN("-c parameter not supported in release build type.");
             break;
 #endif
 
@@ -1212,7 +1332,7 @@ main(int argc, char *argv[])
         }
 
         /* from now print only to syslog, not stderr */
-        openlog("netopeer2-server", LOG_PID, LOG_DAEMON);
+        np2_stderr_log = 0;
     }
 
     /* make sure we are the only instance - lock the PID file and write the PID */
@@ -1295,19 +1415,20 @@ restart:
     } while (i < NP2SRV_THREAD_COUNT);
 
 cleanup:
-
     /* disconnect from sysrepo */
     if (np2srv.sr_subscr) {
         sr_unsubscribe(np2srv.sr_sess.srs, np2srv.sr_subscr);
     }
-    if (np2srv.sr_sess.srs) {
-        sr_session_stop(np2srv.sr_sess.srs);
-    }
-    sr_disconnect(np2srv.sr_conn);
 
     /* libnetconf2 cleanup */
-    nc_ps_clear(np2srv.nc_ps, 1, free_ds);
+    if (np2srv.nc_ps) {
+        nc_ps_clear(np2srv.nc_ps, 1, free_ds);
+    }
     nc_ps_free(np2srv.nc_ps);
+
+    /* clears all the sessions also */
+    sr_disconnect(np2srv.sr_conn);
+
     nc_server_destroy();
 
     /* monitoring cleanup */

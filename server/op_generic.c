@@ -38,8 +38,9 @@ build_rpc_act_from_output(struct lyd_node *rpc_act, sr_val_t *output, size_t out
     for (i = 0; i < out_count; ++i) {
         ly_errno = LY_SUCCESS;
         node = lyd_new_path(rpc_act, np2srv.ly_ctx, output[i].xpath, op_get_srval(np2srv.ly_ctx, &output[i], buf),
-                            0, LYD_PATH_OPT_UPDATE | LYD_PATH_OPT_OUTPUT);
-        if (ly_errno) {
+                (output->type == SR_ANYXML_T || output->type == SR_ANYDATA_T) ? LYD_ANYDATA_SXML : 0,
+                LYD_PATH_OPT_UPDATE | LYD_PATH_OPT_OUTPUT);
+        if (ly_errno != LY_SUCCESS) {
             return -1;
         }
 
@@ -83,33 +84,25 @@ struct nc_server_reply *
 op_generic(struct lyd_node *rpc, struct nc_session *ncs)
 {
     int rc;
-    uint32_t i;
-    char *rpc_xpath;
+    uint32_t i, in_idx = 0;
+    char *rpc_xpath = NULL, *str;
     sr_val_t *input = NULL, *output = NULL;
-    size_t in_count = 0, out_count = 0;
+    size_t out_count = 0;
     struct np2_sessions *sessions;
     struct nc_server_error *e;
-    char *str;
+    struct nc_server_reply *ereply = NULL;
     struct ly_set *set = NULL, *strs = NULL;
     struct lyd_node *reply_data, *next, *act = NULL;
     NC_WD_MODE nc_wd;
-
-    /* get sysrepo connections for this session */
-    sessions = (struct np2_sessions *)nc_session_get_data(ncs);
-
-    /* perform operation on running to make notification
-     * for the sysrepo's subscriber implementing the RPC */
-    if (sessions->ds != SR_DS_RUNNING) {
-        sr_session_switch_ds(sessions->srs, SR_DS_RUNNING);
-        sessions->ds = SR_DS_RUNNING;
-    }
 
     if (rpc->schema->nodetype != LYS_RPC) {
         /* action */
         act = lyd_dup(rpc, 1);
         if (!act) {
-            EINT;
-            goto error;
+            e = nc_err(NC_ERR_OP_FAILED, NC_ERR_TYPE_APP);
+            nc_err_set_msg(e, np2log_lasterr(np2srv.ly_ctx), "en");
+            ereply = nc_server_reply_err(e);
+            goto finish;
         }
 
         LY_TREE_DFS_BEGIN(act, next, rpc) {
@@ -120,66 +113,69 @@ op_generic(struct lyd_node *rpc, struct nc_session *ncs)
         }
         if (!rpc) {
             EINT;
-            goto error;
+            e = nc_err(NC_ERR_OP_FAILED, NC_ERR_TYPE_APP);
+            nc_err_set_msg(e, np2log_lasterr(np2srv.ly_ctx), "en");
+            ereply = nc_server_reply_err(e);
+            goto finish;
         }
+    }
+    rpc_xpath = lyd_path(rpc);
+
+    /* get sysrepo connections for this session */
+    sessions = (struct np2_sessions *)nc_session_get_data(ncs);
+
+    if (np2srv_sr_check_exec_permission(sessions->srs, rpc_xpath, &ereply)) {
+        goto finish;
+    }
+
+    /* perform operation on running to make notification
+     * for the sysrepo's subscriber implementing the RPC */
+    if (sessions->ds != SR_DS_RUNNING) {
+        if (np2srv_sr_session_switch_ds(sessions->srs, SR_DS_RUNNING, &ereply)) {
+            goto finish;
+        }
+        sessions->ds = SR_DS_RUNNING;
     }
 
     /* process input into sysrepo format */
     set = lyd_find_path(rpc, ".//*");
-    in_count = set->number;
-    if (in_count) {
-        input = calloc(in_count, sizeof *input);
+    if (set->number) {
+        input = calloc(set->number, sizeof *input);
         strs = ly_set_new();
         if (!input || !strs) {
             EMEM;
-            goto error;
+            e = nc_err(NC_ERR_OP_FAILED, NC_ERR_TYPE_APP);
+            nc_err_set_msg(e, np2log_lasterr(np2srv.ly_ctx), "en");
+            ereply = nc_server_reply_err(e);
+            goto finish;
         }
-        for (i = 0; i < set->number; ++i) {
+        for (i = 0, in_idx = 0; i < set->number; ++i) {
             if (set->set.d[i]->dflt) {
-                --in_count;
                 continue;
             }
 
-            if (op_set_srval(set->set.d[i], lyd_path(set->set.d[i]), 0, &input[i], &str)) {
-                goto error;
+            if (op_set_srval(set->set.d[i], lyd_path(set->set.d[i]), 0, &input[in_idx], &str)) {
+                e = nc_err(NC_ERR_OP_FAILED, NC_ERR_TYPE_APP);
+                nc_err_set_msg(e, np2log_lasterr(np2srv.ly_ctx), "en");
+                ereply = nc_server_reply_err(e);
+                goto finish;
             }
+            ++in_idx;
+
             if (str) {
-                /* keep pointer to additional memory needed for input[i] */
+                /* keep pointer to additional memory needed for input[in_idx] */
                 ly_set_add(strs, str, LY_SET_OPT_USEASLIST);
             }
         }
     }
-    ly_set_free(set);
-    set = NULL;
-
-    rpc_xpath = lyd_path(rpc);
 
     if (!act) {
-        rc = sr_rpc_send(sessions->srs, rpc_xpath, input, in_count, &output, &out_count);
+        rc = np2srv_sr_rpc_send(sessions->srs, rpc_xpath, input, in_idx, &output, &out_count, &ereply);
     } else {
-        rc = sr_action_send(sessions->srs, rpc_xpath, input, in_count, &output, &out_count);
+        rc = np2srv_sr_action_send(sessions->srs, rpc_xpath, input, in_idx, &output, &out_count, &ereply);
     }
-    free(rpc_xpath);
-    /* free the additional memory chunks used in input[] */
-    if (strs) {
-        for (i = 0; i < strs->number; i++) {
-            free(strs->set.g[i]);
-        }
-        ly_set_free(strs);
-        strs = NULL;
-    }
-    for (i = 0; i < in_count; ++i) {
-        free(input[i].xpath);
-    }
-    free(input);
-    input = NULL;
-    in_count = 0;
-
-    if ((rc == SR_ERR_UNKNOWN_MODEL) || (rc == SR_ERR_NOT_FOUND)) {
-        return nc_server_reply_err(nc_err(NC_ERR_OP_NOT_SUPPORTED, NC_ERR_TYPE_PROT));
-    } else if (rc != SR_ERR_OK) {
-        ERR("Sending an RPC/action (%s) to sysrepo failed (%s).", rpc->schema->name, sr_strerror(rc));
-        goto srerror;
+    if (rc) {
+        goto finish;
     }
 
     if (out_count) {
@@ -192,26 +188,21 @@ op_generic(struct lyd_node *rpc, struct nc_session *ncs)
             reply_data = act;
         }
 
-        sr_free_values(output, out_count);
         if (rc) {
             lyd_free(reply_data);
-            goto srerror;
+            e = nc_err_libyang(np2srv.ly_ctx);
+            ereply = nc_server_reply_err(e);
+            goto finish;
         }
 
         nc_server_get_capab_withdefaults(&nc_wd, NULL);
-        return nc_server_reply_data(reply_data, nc_wd, NC_PARAMTYPE_FREE);
+        ereply = nc_server_reply_data(reply_data, nc_wd, NC_PARAMTYPE_FREE);
     } else {
         lyd_free(act);
-        return nc_server_reply_ok();
+        ereply = nc_server_reply_ok();
     }
 
-srerror:
-    return op_build_err_sr(NULL, sessions->srs);
-
-error:
-    e = nc_err(NC_ERR_OP_FAILED, NC_ERR_TYPE_APP);
-    nc_err_set_msg(e, np2log_lasterr(), "en");
-
+finish:
     ly_set_free(set);
     if (strs) {
         for (i = 0; i < strs->number; i++) {
@@ -219,11 +210,11 @@ error:
         }
         ly_set_free(strs);
     }
-    for (i = 0; i < in_count; ++i) {
+    for (i = 0; i < in_idx; ++i) {
         free(input[i].xpath);
     }
     free(input);
     sr_free_values(output, out_count);
-
-    return nc_server_reply_err(e);
+    free(rpc_xpath);
+    return ereply;
 }
