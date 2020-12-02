@@ -117,7 +117,7 @@ get_sr_data:
     if (!strcmp(op_path, "/ietf-netconf:get") && (ds == SR_DS_RUNNING)) {
         /* we have running data, now append state data */
         ds = SR_DS_OPERATIONAL;
-        get_opts = SR_OPER_NO_CONFIG;
+        // get_opts = SR_OPER_NO_CONFIG;
         goto get_sr_data;
     }
 
