@@ -77,6 +77,8 @@ np2srv_ntf_new_cb(sr_session_ctx_t *UNUSED(session), const sr_ev_notif_type_t no
     struct lyd_node *ly_ntf = NULL;
     NC_MSG_TYPE msg_type;
     char buf[26], *datetime;
+    
+    ERR("TRACING np2srv_ntf_new_cb for session %d .", nc_session_get_id(ncs));
 
     /* create these notifications, sysrepo only emulates them */
     if (notif_type == SR_EV_NOTIF_REPLAY_COMPLETE) {
@@ -103,6 +105,7 @@ np2srv_ntf_new_cb(sr_session_ctx_t *UNUSED(session), const sr_ev_notif_type_t no
 
     /* send the notification */
     msg_type = nc_server_notif_send(ncs, nc_ntf, NP2SRV_NOTIF_SEND_TIMEOUT);
+    ERR("TRACING  np2srv_ntf_new_cb Sending a notification to session %d was successful.", nc_session_get_id(ncs));
     if ((msg_type == NC_MSG_ERROR) || (msg_type == NC_MSG_WOULDBLOCK)) {
         ERR("Sending a notification to session %d %s.", nc_session_get_id(ncs), msg_type == NC_MSG_ERROR ? "failed" : "timed out");
         goto cleanup;
