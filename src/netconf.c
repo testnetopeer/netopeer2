@@ -726,6 +726,7 @@ np2srv_rpc_subscribe_cb(sr_session_ctx_t *session, const char *UNUSED(op_path), 
                         if (!parent) {
                             rc = sr_event_notif_subscribe_tree(nc_session_get_data(ncs), ly_mod->name, xp, start, stop,
                                     np2srv_ntf_new_cb, ncs, np2srv.sr_notif_sub ? SR_SUBSCR_CTX_REUSE : 0, &np2srv.sr_notif_sub);
+                            ERR("TRACING added notif subscribption. Netconf session %u. Sysrepo session %u. Module name %s. Xpath %s.", nc_session_get_id(ncs), sr_session_get_nc_id(session),  ly_mod->name, xp);
                             break;
                         }
                     }
@@ -742,6 +743,7 @@ np2srv_rpc_subscribe_cb(sr_session_ctx_t *session, const char *UNUSED(op_path), 
     } else {
         rc = sr_event_notif_subscribe_tree(nc_session_get_data(ncs), stream, xp, start, stop, np2srv_ntf_new_cb, ncs,
                 np2srv.sr_notif_sub ? SR_SUBSCR_CTX_REUSE : 0, &np2srv.sr_notif_sub);
+        ERR("TRACING added notif subscribption 2. Netconf session %u. Sysrepo session %u. Module name %s. Xpath %s.", nc_session_get_id(ncs), sr_session_get_nc_id(session),  ly_mod->name, xp);
     }
     if (rc != SR_ERR_OK) {
         goto cleanup;
